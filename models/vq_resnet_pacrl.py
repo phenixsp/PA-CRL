@@ -203,75 +203,68 @@ class VQResNetPaCRL(nn.Module):
 
         return mask_z, binarized_mask, masking_rate
 
+    @torch.no_grad()
     def create_mask_z_adjacent_dist(self, z, ids, **kwargs):
+        ids = ids.unsqueeze(1)
+        B, _, H, W = ids.shape
+        quant = kwargs["quant"]
 
-        def get_embedded_vectors_from_IBQ(quantizer, stacked_ids):
-            flat_ids = rearrange(stacked_ids, 'b n hw -> (b n) hw')
-            shape = (flat_ids.shape[0], H, W,  quantizer.e_dim)
-            z_q = quantizer.get_codebook_entry(flat_ids, shape=shape)  # [batch*9, dim, h, w]
-            return z_q
+        # Padding ids
+        paded_ids = F.pad(ids, (1, 1, 1, 1), mode='replicate')  # (B, 1, H+2, W+2)
 
-        with torch.no_grad():
-            ids = ids.unsqueeze(1)
-            B, _, H, W = ids.shape
-            quant = kwargs["quant"]
+        # Extracting shifted versions
+        shifts = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+        shifted_ids = []
+        for dy, dx in shifts:
+            shifted_ids.append(paded_ids[:, :, 1 + dy:H + 1 + dy, 1 + dx:W + 1 + dx])
 
-            # Padding ids
-            paded_ids = F.pad(ids, (1, 1, 1, 1), mode='replicate')  # (B, 1, H+2, W+2)
+        # Concatenating stacked_ids
+        stacked_ids = torch.cat([ids] + shifted_ids, dim=1)  # (B, 9, H, W)
+        stacked_ids = rearrange(stacked_ids, 'b n h w -> b n (h w)')
 
-            # Extracting shifted versions
-            shifts = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
-            shifted_ids = []
-            for dy, dx in shifts:
-                shifted_ids.append(paded_ids[:, :, 1 + dy:H + 1 + dy, 1 + dx:W + 1 + dx])
+        # Mapping ids to embeddings
+        assert isinstance(quant, Quantize)
+        embedded_vectors = quant.embed[:, stacked_ids]
+        embedded_vectors = rearrange(embedded_vectors, 'd b n (hw) -> b n (hw) d', n=9)
 
-            # Concatenating stacked_ids
-            stacked_ids = torch.cat([ids] + shifted_ids, dim=1)  # (B, 9, H, W)
-            stacked_ids = rearrange(stacked_ids, 'b n h w -> b n (h w)')
+        # Compute squared L2 distance
+        embedded_vectors = F.normalize(embedded_vectors, dim=-1)
+        flatten = embedded_vectors[:, 0, :, :]  # (B, H*W, dim) -> original ids' embeddings
+        others = embedded_vectors[:, 1:, :, :]  # (B, 8, H*W, dim) -> shifted embeddings
 
-            # Mapping ids to embeddings
-            assert isinstance(quant, Quantize)
-            embedded_vectors = quant.embed[:, stacked_ids]
-            embedded_vectors = rearrange(embedded_vectors, 'd b n (hw) -> b n (hw) d', n=9)
+        flatten_sq = flatten.pow(2).sum(-1, keepdim=True)  # (B, H*W, 1)
+        others_sq = others.pow(2).sum(-1)  # (B, 8, H*W)
+        cross_term = 2 * torch.einsum('bnd,bmnd->bmn', flatten, others)  # (B, 8, H*W)
 
-            # Compute squared L2 distance
-            embedded_vectors = F.normalize(embedded_vectors, dim=-1)
-            flatten = embedded_vectors[:, 0, :, :]  # (B, H*W, dim) -> original ids' embeddings
-            others = embedded_vectors[:, 1:, :, :]  # (B, 8, H*W, dim) -> shifted embeddings
+        dist = flatten_sq.transpose(1, 2).expand(-1, 8, -1) - cross_term + others_sq  # (B, 8, H*W)
 
-            flatten_sq = flatten.pow(2).sum(-1, keepdim=True)  # (B, H*W, 1)
-            others_sq = others.pow(2).sum(-1)  # (B, 8, H*W)
-            cross_term = 2 * torch.einsum('bnd,bmnd->bmn', flatten, others)  # (B, 8, H*W)
+        # Compute average distance
+        distance = dist.mean(dim=1, keepdim=True).squeeze()  # (B, 1, H*W)
+        final_dist_map = distance.squeeze().view(B, H, W).clone()
 
-            dist = flatten_sq.transpose(1, 2).expand(-1, 8, -1) - cross_term + others_sq  # (B, 8, H*W)
+        # mask = normalize_distance(distance)
+        mask = torch.sigmoid(distance)
+        mask = mask.view(B, H, W)
 
-            # Compute average distance
-            distance = dist.mean(dim=1, keepdim=True).squeeze()  # (B, 1, H*W)
-            final_dist_map = distance.squeeze().view(B, H, W).clone()
+        mask_np = mask.detach().cpu().numpy().astype(np.float32)  # (B, N, N)
+        mask_np = (mask_np - 0.5) / 0.5  # [0.0, 1.0]
+        binarized_mask = np.zeros_like(mask_np, dtype=np.uint8)
+        if self.args.mask_th == -1:
+            for b in range(mask_np.shape[0]):
+                mask_flat = (mask_np[b] * 255).astype(np.uint8).clip(0, 255)
+                threshold = threshold_otsu(mask_flat)
+                binarized_mask[b] = (mask_flat < threshold).astype(np.uint8)
+        else:
+            for b in range(mask_np.shape[0]):
+                binarized_mask[b] = (mask_np[b] < self.args.mask_th)
 
-            # mask = normalize_distance(distance)
-            mask = torch.sigmoid(distance)
-            mask = mask.view(B, H, W)
+        binarized_mask = torch.tensor(binarized_mask, dtype=torch.bool, device=ids.device)
+        masking_rate = (torch.sum(binarized_mask.reshape(B, -1), dim=1) / (H * W)).mean().item()
 
-            mask_np = mask.detach().cpu().numpy().astype(np.float32)  # (B, N, N)
-            mask_np = (mask_np - 0.5) / 0.5  # [0.0, 1.0]
-            binarized_mask = np.zeros_like(mask_np, dtype=np.uint8)
-            if self.args.mask_th == -1:
-                for b in range(mask_np.shape[0]):
-                    mask_flat = (mask_np[b] * 255).astype(np.uint8).clip(0, 255)
-                    threshold = threshold_otsu(mask_flat)
-                    binarized_mask[b] = (mask_flat < threshold).astype(np.uint8)
-            else:
-                for b in range(mask_np.shape[0]):
-                    binarized_mask[b] = (mask_np[b] < self.args.mask_th)
-
-            binarized_mask = torch.tensor(binarized_mask, dtype=torch.bool, device=ids.device)
-            masking_rate = (torch.sum(binarized_mask.reshape(B, -1), dim=1) / (H * W)).mean().item()
-
-            mask_expanded = binarized_mask.unsqueeze(1)  # (B, 1, H, W)
-            masked_z = z * mask_expanded
-            mean_z = masked_z.mean(dim=1, keepdim=True)  # (B, 1, H, W)
-            mask_z = torch.where(mask_expanded, mean_z.expand_as(z), z)
+        mask_expanded = binarized_mask.unsqueeze(1)  # (B, 1, H, W)
+        masked_z = z * mask_expanded
+        mean_z = masked_z.mean(dim=1, keepdim=True)  # (B, 1, H, W)
+        mask_z = torch.where(mask_expanded, mean_z.expand_as(z), z)
 
         mask_z = z + (mask_z - z).detach()
         return mask_z, binarized_mask.squeeze(), masking_rate, final_dist_map, threshold
@@ -444,9 +437,9 @@ class VQResNetPaCRL(nn.Module):
         info = {
             "vq_utility": vq_utility,
             "masking_rate": masking_rate if not self.args.use_random_masking else None,
-            "threshold": threshold,
+            "threshold": threshold if not self.args.use_random_masking else None,
             "mask": mask,
-            "dist_map": final_dist_map,
+            "dist_map": final_dist_map if not self.args.use_random_masking else None,
             "rec_x": rec_x,
             "vq_idx": id if not self.args.use_random_masking else None,
         }

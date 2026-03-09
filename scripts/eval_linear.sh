@@ -1,0 +1,1 @@
+python main_lincls.py --data DATA_ROOT --arch 'resnet50' --pretrained PRETRAINED_MODEL --ckpt_dir LOG_ROOT
