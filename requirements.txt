@@ -1,0 +1,12 @@
+torch==2.2.2
+torchvision==0.17.2
+opencv-python-headless==4.9.0.80
+scikit-image
+einops==0.8.2
+numpy>=1.24.0
+scikit-learn>=1.0
+matplotlib==3.10.8
+seaborn==0.13.2
+tqdm==4.65.2
+PyYAML==6.0.1
+apex==0.1
